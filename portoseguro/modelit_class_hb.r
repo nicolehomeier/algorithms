@@ -1,4 +1,14 @@
-ds = read.csv("train.csv",na.strings=c("-1","-1.0"))
+library(caret)
+library(MLmetrics)
+library(plyr)
+library(dplyr)
+#set.seed(1234)
+kfold = 2
+hb_perc = 0.25
+
+ds = read.csv("interm_train.csv")
+ds$id = NULL
+ds$target = as.factor(ds$target)
 
 pattern="bin|cat"
 for (i in 1:ncol(ds)){
@@ -7,66 +17,35 @@ for (i in 1:ncol(ds)){
     }
 }
 
-facmode = function(x){
-    tab = table(x)
-    names(tab)[tab==max(tab)]
-}
+inHB = createDataPartition(ds$target,p=hb_perc,list=TRUE)[[1]]
+hb_test = ds[inHB,]
+hb_train = ds[-inHB,]
 
-#feature engineering
+gbm_hb_kfold=0
+ens_hb_kfold=0
+med_hb_kfold=0
 
-ds$nact = apply(ds,1,function(x) sum(is.na(x)))
+useds = hb_train
+groups = createFolds(useds$target,k=kfold,list=TRUE)
 
-#replace NAs
-for (i in 2:ncol(ds)){
-    if (class(ds[,i]) == "factor" & sum(is.na(ds[,i])) > 0){
-        ds[which(is.na(ds[,i])),i] = facmode(ds[,i])
-    } else if (sum(is.na(ds[,i])) > 0){
-        ds[which(is.na(ds[,i])),i] = median(ds[,i],na.rm=T)
-    }
-}
+for (i in 1:kfold){
+    inTest = groups[[i]]
+    training = useds[-inTest,]
+    testing = useds[inTest,]
 
-#ds$target[which(ds$target == 1)] = 'claim'
-#ds$target[which(ds$target == 0)] = 'noclaim'
+#upsample to balance the classes
+    clms = which(training$target == 1)
+    nulls = which(training$target==0)
+    upsamples = sample(length(clms),length(nulls),replace=T)
+    newclms = training[clms[upsamples],]
+    training = rbind(training[nulls,],newclms)
 
-ds$id = NULL
-
-keepvarshigh = c("target","ps_ind_01","ps_ind_03","ps_ind_05_cat","ps_ind_07_bin",
-"ps_ind_08_bin","ps_ind_15","ps_ind_16_bin","ps_ind_17_bin","ps_reg_01","ps_reg_02",
-"ps_reg_03","ps_car_03_cat","ps_car_05_cat","ps_car_06_cat","ps_car_07_cat","ps_car_12",
-"ps_car_13","ps_car_14","ps_car_15","nact")
-
-gbmvars = c("target","ps_car_13","ps_ind_05_cat","ps_ind_17_bin","ps_reg_03","ps_car_03_cat",
-"ps_car_07_cat","ps_ind_07_bin","ps_ind_15","ps_ind_03","ps_reg_02","ps_ind_16_bin","nact")
-
-kvh = which(names(ds) %in% keepvarshigh)
-gh = which(names(ds) %in% gbmvars)
-
-ds$target = as.factor(ds$target)
-
-perc = 0.5
-saveit = data.frame(matrix(nrow=5,ncol=6))
-
-for (i in 1:5){
-    useds = ds
-    inTrain = createDataPartition(useds$target,p=perc,list=TRUE)[[1]]
-    training = useds[inTrain,]
-    testing = useds[-inTrain,]
-    
-    #   params = list(eta=0.09,max_depth=4,colsample_bytree=0.5,min_child_weight=50,subsample=1,gamma=5,objective='binary:logistic',booster='gbtree',eval_metric='auc')
-    #  train_tmp = training
-    #test = xgb.DMatrix(as.matrix(testing))
-    #y=train_tmp$target
-    #train_tmp$target = NULL
-    #train_tmp = xgb.DMatrix(as.matrix(train_tmp),label=y)
-    #xgfit = xgb.train(params,data=train_tmp,nrounds=10,verbose=F)
-    #predxgb = predict(xgfit,newdata=test)
-    #p0 = normalizedGini(predxgb,testing$target)
-    
     print("training")
     glmfit = glm(target~.,training,family=binomial)
     print("predicting")
     pglm = predict(glmfit,type="response")
     predglm = predict(glmfit,newdata=testing,type="response")
+    predglm_hb = predict(glmfit,newdata=hb_test,type="response")
     print("checking accuracy")
     p1 = NormalizedGini(predglm,as.numeric(as.character(testing$target)))
     
@@ -75,32 +54,70 @@ for (i in 1:5){
     print("predicting")
     plda = predict(ldafit,type="prob")
     predlda = predict(ldafit,newdata=testing,type="prob")
+    predlda_hb = predict(ldafit,newdata=hb_test,type="prob")
     print("checking accuracy")
     p2 = NormalizedGini(predlda[,2],as.numeric(as.character(testing$target)))
     
-   
     print("training")
-    gbmfit = train(target~.,data=training,method="gbm",metric="Kappa",trControl=trainControl(method="cv",number=2),verbose=F)
+       gbmfit = train(target~.,data=training,method="gbm",metric="Kappa",trControl=trainControl(method="cv",number=2),
+    tuneGrid=expand.grid(.n.trees=150,.interaction.depth=2,.shrinkage=0.1,.n.minobsinnode=10),verbose=F)
+    # gbmfit = gbm(target~.,data=training,n.trees=150,shrinkage=0.1,n.minobsinnode=10)
     print("predicting")
     pgbm = predict(gbmfit,type="prob")
     predgbm = predict(gbmfit,newdata=testing,type="prob")
+    predgbm_hb = predict(gbmfit,newdata=hb_test,type="prob")
     print("checking accuracy")
     p3 = NormalizedGini(predgbm[,2],as.numeric(as.character(testing$target)))
   
   #see if ensemble fitting helps performance
-    ensfit = glm(training.target~.,data=data.frame(training$target,pglm,plda[,2],pnn,pgbm[,2]),family=binomial)
-    newdata = data.frame(predglm,predlda[,2],prednn,predgbm[,2])
+    ensfit = glm(training.target~.,data=data.frame(training$target,pglm,plda[,2],pgbm[,2]),family=binomial)
+    newdata = data.frame(predglm,predlda[,2],predgbm[,2])
+    newdata_hb = data.frame(predglm_hb,predlda_hb[,2],predgbm_hb[,2])
     names(newdata) = c("pglm","plda...2.","pgbm...2.")
+    names(newdata_hb) = c("pglm","plda...2.","pgbm...2.")
     predens = predict(ensfit,newdata=newdata,type="response")
+    predens_hb = predict(ensfit,newdata=newdata_hb,type="response")
     pens = NormalizedGini(predens,as.numeric(as.character(testing$target)))
     
     mpred = apply(newdata,1,median)
     pmed = NormalizedGini(mpred,as.numeric(as.character(testing$target)))
+    mpred_hb = apply(newdata_hb,1,median)
     
   # fit = train(target~.,data=training,method="regLogistic",trControl=trainControl(method="cv",number=2))
   #predfit = predict(fit,newdata=testing,type="prob")
   #pfit = normGini(as.numeric(as.character(testing$target)),predfit[,2])
-  
-    saveit[i,] = data.frame(p1,p2,p3,pmed,pens)
-    print(paste(p1,p2,p3,pmed,pens))
+    print(paste(round(p1,digits=3),round(p2,digits=3),round(p3,digits=3),round(pmed,digits=3),round(pens,digits=3)))
+    
+    gbm_hb_kfold = gbm_hb_kfold + predgbm_hb[,2]
+    ens_hb_kfold = ens_hb_kfold + predens_hb
+    med_hb_kfold = med_hb_kfold + mpred_hb
 }
+
+gbm_hb_kfold = gbm_hb_kfold/kfold
+ens_hb_kfold = ens_hb_kfold/kfold
+med_hb_kfold = med_hb_kfold/kfold
+
+#evaluate how the models performed on the hold-back sample
+ng_gbm = NormalizedGini(gbm_hb_kfold,as.numeric(as.character(hb_test$target)))
+ng_ens = NormalizedGini(ens_hb_kfold,as.numeric(as.character(hb_test$target)))
+ng_med = NormalizedGini(med_hb_kfold,as.numeric(as.character(hb_test$target)))
+print(round(ng_gbm,digits=3))
+print(round(ng_ens,digits=3))
+print(round(ng_med,digits=3))
+
+#now let's evaluate whether the performance differences are significant
+# first price 'cats' number of risk groups, assuming 'cc' claim cost and 'gain' desired remainder per policy after losses
+
+#order the last testing sample and hold-back sample by the model predictions
+ord_gbm = testing$target[order(predgbm[,2],decreasing=T)]
+ord_med = testing$target[order(mpred,decreasing=T)]
+ord_gbm_hb = hb_test$target[order(gbm_hb_kfold,decreasing=T)]
+ord_med_hb = hb_test$target[order(med_hb_kfold,decreasing=T)]
+
+out = data.frame(ord_gbm_hb,ord_med_hb)
+out_test = data.frame(ord_gbm,ord_med)
+names(out) = c("GBM-5fold-HB","Median-5fold-HB")
+names(out_test) = c("GBM-5fold-LastTest","Median-5fold-LastTest")
+write.csv(out,"holdback_ordered_output.csv",row.names=F)
+write.csv(out_test,"test_ordered_output.csv",row.names=F)
+
